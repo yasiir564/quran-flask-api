@@ -2,9 +2,13 @@ import os
 import requests
 from flask import Flask, jsonify, current_app
 from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS  # Import the Flask-CORS extension
 
 # Initialize Flask app
 app = Flask(__name__)
+
+# Enable CORS for all routes
+CORS(app)
 
 # Configure database connection using the environment variable DATABASE_URL
 # Fall back to a default URL if environment variable is not set
@@ -40,10 +44,9 @@ class Ayah(db.Model):
         return f"<Ayah {self.id} from Surah {self.surah_id}>"
 
 # Create and initialize database tables
-@app.cli.command("init-db")
-def init_db():
+@app.before_first_request
+def create_tables():
     db.create_all()
-    print("Database tables created.")
 
 # Home route to check the app is working
 @app.route('/')
@@ -62,140 +65,134 @@ def fetch_quran():
             return jsonify({"error": "Failed to fetch Quran"}), 500
         
         for s in data['data']['surahs']:
-            with app.app_context():
-                # Check if surah already exists
-                surah = Surah.query.get(s['number'])
+            # Check if surah already exists
+            surah = Surah.query.get(s['number'])
+            
+            if not surah:
+                surah = Surah(
+                    id=s['number'],
+                    name=s['name'],
+                    english_name=s['englishName'],
+                    number_of_ayahs=s['numberOfAyahs'],
+                    revelation_type=s['revelationType']
+                )
+                db.session.add(surah)
+            else:
+                # Update existing surah
+                surah.name = s['name']
+                surah.english_name = s['englishName']
+                surah.number_of_ayahs = s['numberOfAyahs']
+                surah.revelation_type = s['revelationType']
+            
+            db.session.commit()
+            
+            for a in s['ayahs']:
+                # Check if ayah already exists
+                ayah = Ayah.query.get(a['number'])
                 
-                if not surah:
-                    surah = Surah(
-                        id=s['number'],
-                        name=s['name'],
-                        english_name=s['englishName'],
-                        number_of_ayahs=s['numberOfAyahs'],
-                        revelation_type=s['revelationType']
+                if not ayah:
+                    ayah = Ayah(
+                        id=a['number'],
+                        surah_id=s['number'],
+                        number_in_surah=a['numberInSurah'],
+                        text_arabic=a['text'],
+                        text_translation=a.get('text', ''),
+                        juz=a.get('juz', 0)
                     )
-                    db.session.add(surah)
+                    db.session.add(ayah)
                 else:
-                    # Update existing surah
-                    surah.name = s['name']
-                    surah.english_name = s['englishName']
-                    surah.number_of_ayahs = s['numberOfAyahs']
-                    surah.revelation_type = s['revelationType']
+                    # Update existing ayah
+                    ayah.surah_id = s['number']
+                    ayah.number_in_surah = a['numberInSurah']
+                    ayah.text_arabic = a['text']
+                    ayah.text_translation = a.get('text', '')
+                    ayah.juz = a.get('juz', 0)
                 
                 db.session.commit()
-            
-            # Process ayahs in separate transactions to avoid large transaction issues
-            for a in s['ayahs']:
-                with app.app_context():
-                    # Check if ayah already exists
-                    ayah = Ayah.query.get(a['number'])
-                    
-                    if not ayah:
-                        ayah = Ayah(
-                            id=a['number'],
-                            surah_id=s['number'],
-                            number_in_surah=a['numberInSurah'],
-                            text_arabic=a['text'],
-                            text_translation=a.get('text', ''),
-                            juz=a.get('juz', 0)
-                        )
-                        db.session.add(ayah)
-                    else:
-                        # Update existing ayah
-                        ayah.surah_id = s['number']
-                        ayah.number_in_surah = a['numberInSurah']
-                        ayah.text_arabic = a['text']
-                        ayah.text_translation = a.get('text', '')
-                        ayah.juz = a.get('juz', 0)
-                    
-                    db.session.commit()
         
         return jsonify({"message": "Quran data fetched and stored successfully!"})
     except Exception as e:
+        db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
 # Get all surahs
 @app.route('/surahs', methods=['GET'])
 def get_surahs():
-    with app.app_context():
-        surahs = Surah.query.all()
-        result = [{
-            "id": s.id,
-            "name": s.name,
-            "english_name": s.english_name,
-            "number_of_ayahs": s.number_of_ayahs,
-            "revelation_type": s.revelation_type
-        } for s in surahs]
-        
-        return jsonify(result)
+    surahs = Surah.query.all()
+    result = [{
+        "id": s.id,
+        "name": s.name,
+        "english_name": s.english_name,
+        "number_of_ayahs": s.number_of_ayahs,
+        "revelation_type": s.revelation_type
+    } for s in surahs]
+    
+    return jsonify(result)
 
 # Get a specific surah by ID
 @app.route('/surah/<int:surah_id>', methods=['GET'])
 def get_surah(surah_id):
-    with app.app_context():
-        surah = Surah.query.get(surah_id)
-        
-        if not surah:
-            return jsonify({"error": "Surah not found"}), 404
-        
-        ayahs = Ayah.query.filter_by(surah_id=surah_id).all()
-        
-        result = {
-            "id": surah.id,
-            "name": surah.name,
-            "english_name": surah.english_name,
-            "number_of_ayahs": surah.number_of_ayahs,
-            "revelation_type": surah.revelation_type,
-            "ayahs": [{
-                "id": a.id,
-                "number_in_surah": a.number_in_surah,
-                "text_arabic": a.text_arabic,
-                "text_translation": a.text_translation,
-                "juz": a.juz
-            } for a in ayahs]
-        }
-        
-        return jsonify(result)
-
-# Get ayahs from a specific surah
-@app.route('/surah/<int:surah_id>/ayahs', methods=['GET'])
-def get_surah_ayahs(surah_id):
-    with app.app_context():
-        surah = Surah.query.get(surah_id)
-        
-        if not surah:
-            return jsonify({"error": "Surah not found"}), 404
-        
-        ayahs = Ayah.query.filter_by(surah_id=surah_id).all()
-        result = [{
+    surah = Surah.query.get(surah_id)
+    
+    if not surah:
+        return jsonify({"error": "Surah not found"}), 404
+    
+    ayahs = Ayah.query.filter_by(surah_id=surah_id).all()
+    
+    result = {
+        "id": surah.id,
+        "name": surah.name,
+        "english_name": surah.english_name,
+        "number_of_ayahs": surah.number_of_ayahs,
+        "revelation_type": surah.revelation_type,
+        "ayahs": [{
             "id": a.id,
             "number_in_surah": a.number_in_surah,
             "text_arabic": a.text_arabic,
             "text_translation": a.text_translation,
             "juz": a.juz
         } for a in ayahs]
-        
-        return jsonify(result)
+    }
+    
+    return jsonify(result)
+
+# Get ayahs from a specific surah
+@app.route('/surah/<int:surah_id>/ayahs', methods=['GET'])
+def get_surah_ayahs(surah_id):
+    surah = Surah.query.get(surah_id)
+    
+    if not surah:
+        return jsonify({"error": "Surah not found"}), 404
+    
+    ayahs = Ayah.query.filter_by(surah_id=surah_id).all()
+    result = [{
+        "id": a.id,
+        "number_in_surah": a.number_in_surah,
+        "text_arabic": a.text_arabic,
+        "text_translation": a.text_translation,
+        "juz": a.juz
+    } for a in ayahs]
+    
+    return jsonify(result)
 
 # Get a specific ayah by ID
 @app.route('/ayah/<int:ayah_id>', methods=['GET'])
 def get_ayah(ayah_id):
-    with app.app_context():
-        ayah = Ayah.query.get(ayah_id)
-        
-        if not ayah:
-            return jsonify({"error": "Ayah not found"}), 404
-        
-        result = {
-            "id": ayah.id,
-            "surah_id": ayah.surah_id,
-            "number_in_surah": ayah.number_in_surah,
-            "text_arabic": ayah.text_arabic,
-            "text_translation": ayah.text_translation,
-            "juz": ayah.juz
-        }
-        
-        return jsonify(result)
+    ayah = Ayah.query.get(ayah_id)
+    
+    if not ayah:
+        return jsonify({"error": "Ayah not found"}), 404
+    
+    result = {
+        "id": ayah.id,
+        "surah_id": ayah.surah_id,
+        "number_in_surah": ayah.number_in_surah,
+        "text_arabic": ayah.text_arabic,
+        "text_translation": ayah.text_translation,
+        "juz": ayah.juz
+    }
+    
+    return jsonify(result)
 
 if __name__ == '__main__':
     with app.app_context():
