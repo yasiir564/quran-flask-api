@@ -1,5 +1,6 @@
 import os
 import requests
+import psycopg2
 from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS  # Import the Flask-CORS extension
@@ -11,8 +12,14 @@ app = Flask(__name__)
 CORS(app)
 
 # Configure database connection using the environment variable DATABASE_URL
-# Fall back to a default URL if environment variable is not set
-database_url = os.getenv("DATABASE_URL", "postgresql://your_user:your_pass@your_host:5432/your_db")
+# Handle Heroku's postgres:// vs postgresql:// difference and provide fallback
+database_url = os.getenv("DATABASE_URL")
+if database_url and database_url.startswith("postgres://"):
+    # Heroku uses postgres:// but SQLAlchemy requires postgresql://
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+elif not database_url:
+    database_url = "postgresql://your_user:your_pass@your_host:5432/your_db"
+
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False  # Disable Flask-SQLAlchemy track modifications
 
@@ -43,9 +50,16 @@ class Ayah(db.Model):
     def __repr__(self):
         return f"<Ayah {self.id} from Surah {self.surah_id}>"
 
-# Create tables within app context
-with app.app_context():
-    db.create_all()
+# Create tables within app context with proper error handling
+try:
+    with app.app_context():
+        db.create_all()
+        print("Database tables created successfully")
+except Exception as e:
+    print(f"Database connection error: {e}")
+    # Uncomment these lines if you want the app to exit when DB connection fails
+    # import sys
+    # sys.exit(1)
 
 # Home route to check the app is working
 @app.route('/')
@@ -117,81 +131,94 @@ def fetch_quran():
 # Get all surahs
 @app.route('/surahs', methods=['GET'])
 def get_surahs():
-    surahs = Surah.query.all()
-    result = [{
-        "id": s.id,
-        "name": s.name,
-        "english_name": s.english_name,
-        "number_of_ayahs": s.number_of_ayahs,
-        "revelation_type": s.revelation_type
-    } for s in surahs]
-    
-    return jsonify(result)
+    try:
+        surahs = Surah.query.all()
+        result = [{
+            "id": s.id,
+            "name": s.name,
+            "english_name": s.english_name,
+            "number_of_ayahs": s.number_of_ayahs,
+            "revelation_type": s.revelation_type
+        } for s in surahs]
+        
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # Get a specific surah by ID
 @app.route('/surah/<int:surah_id>', methods=['GET'])
 def get_surah(surah_id):
-    surah = Surah.query.get(surah_id)
-    
-    if not surah:
-        return jsonify({"error": "Surah not found"}), 404
-    
-    ayahs = Ayah.query.filter_by(surah_id=surah_id).all()
-    
-    result = {
-        "id": surah.id,
-        "name": surah.name,
-        "english_name": surah.english_name,
-        "number_of_ayahs": surah.number_of_ayahs,
-        "revelation_type": surah.revelation_type,
-        "ayahs": [{
+    try:
+        surah = Surah.query.get(surah_id)
+        
+        if not surah:
+            return jsonify({"error": "Surah not found"}), 404
+        
+        ayahs = Ayah.query.filter_by(surah_id=surah_id).all()
+        
+        result = {
+            "id": surah.id,
+            "name": surah.name,
+            "english_name": surah.english_name,
+            "number_of_ayahs": surah.number_of_ayahs,
+            "revelation_type": surah.revelation_type,
+            "ayahs": [{
+                "id": a.id,
+                "number_in_surah": a.number_in_surah,
+                "text_arabic": a.text_arabic,
+                "text_translation": a.text_translation,
+                "juz": a.juz
+            } for a in ayahs]
+        }
+        
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Get ayahs from a specific surah
+@app.route('/surah/<int:surah_id>/ayahs', methods=['GET'])
+def get_surah_ayahs(surah_id):
+    try:
+        surah = Surah.query.get(surah_id)
+        
+        if not surah:
+            return jsonify({"error": "Surah not found"}), 404
+        
+        ayahs = Ayah.query.filter_by(surah_id=surah_id).all()
+        result = [{
             "id": a.id,
             "number_in_surah": a.number_in_surah,
             "text_arabic": a.text_arabic,
             "text_translation": a.text_translation,
             "juz": a.juz
         } for a in ayahs]
-    }
-    
-    return jsonify(result)
-
-# Get ayahs from a specific surah
-@app.route('/surah/<int:surah_id>/ayahs', methods=['GET'])
-def get_surah_ayahs(surah_id):
-    surah = Surah.query.get(surah_id)
-    
-    if not surah:
-        return jsonify({"error": "Surah not found"}), 404
-    
-    ayahs = Ayah.query.filter_by(surah_id=surah_id).all()
-    result = [{
-        "id": a.id,
-        "number_in_surah": a.number_in_surah,
-        "text_arabic": a.text_arabic,
-        "text_translation": a.text_translation,
-        "juz": a.juz
-    } for a in ayahs]
-    
-    return jsonify(result)
+        
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # Get a specific ayah by ID
 @app.route('/ayah/<int:ayah_id>', methods=['GET'])
 def get_ayah(ayah_id):
-    ayah = Ayah.query.get(ayah_id)
-    
-    if not ayah:
-        return jsonify({"error": "Ayah not found"}), 404
-    
-    result = {
-        "id": ayah.id,
-        "surah_id": ayah.surah_id,
-        "number_in_surah": ayah.number_in_surah,
-        "text_arabic": ayah.text_arabic,
-        "text_translation": ayah.text_translation,
-        "juz": ayah.juz
-    }
-    
-    return jsonify(result)
+    try:
+        ayah = Ayah.query.get(ayah_id)
+        
+        if not ayah:
+            return jsonify({"error": "Ayah not found"}), 404
+        
+        result = {
+            "id": ayah.id,
+            "surah_id": ayah.surah_id,
+            "number_in_surah": ayah.number_in_surah,
+            "text_arabic": ayah.text_arabic,
+            "text_translation": ayah.text_translation,
+            "juz": ayah.juz
+        }
+        
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
