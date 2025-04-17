@@ -1,6 +1,6 @@
 import os
 import requests
-from flask import Flask, jsonify, current_app
+from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS  # Import the Flask-CORS extension
 
@@ -43,9 +43,8 @@ class Ayah(db.Model):
     def __repr__(self):
         return f"<Ayah {self.id} from Surah {self.surah_id}>"
 
-# Create and initialize database tables
-@app.before_first_request
-def create_tables():
+# Create tables within app context
+with app.app_context():
     db.create_all()
 
 # Home route to check the app is working
@@ -195,6 +194,4 @@ def get_ayah(ayah_id):
     return jsonify(result)
 
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
     app.run(debug=True)
