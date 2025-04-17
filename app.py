@@ -23,7 +23,6 @@ class Surah(db.Model):
     english_name = db.Column(db.String(100), nullable=False)
     number_of_ayahs = db.Column(db.Integer, nullable=False)
     revelation_type = db.Column(db.String(20), nullable=True)
-    ayahs = db.relationship("Ayah", back_populates="surah", lazy='dynamic')
     
     def __repr__(self):
         return f"<Surah {self.name}>"
@@ -36,14 +35,12 @@ class Ayah(db.Model):
     text_arabic = db.Column(db.Text, nullable=False)
     text_translation = db.Column(db.Text, nullable=True)
     juz = db.Column(db.Integer, nullable=True)
-    surah = db.relationship("Surah", back_populates="ayahs")
     
     def __repr__(self):
         return f"<Ayah {self.id} from Surah {self.surah_id}>"
 
 # Create tables
-@app.before_first_request
-def create_tables():
+with app.app_context():
     db.create_all()
 
 # Home route to check the app is working
@@ -54,58 +51,64 @@ def home():
 # Fetch Quran data from external API and store in database
 @app.route('/fetch-quran', methods=['GET'])
 def fetch_quran():
-    api_url = "http://api.alquran.cloud/v1/quran/en.asad"  # English + Arabic
-    response = requests.get(api_url)
-    data = response.json()
-    
-    if data["status"] != "OK":
-        return jsonify({"error": "Failed to fetch Quran"}), 500
-    
-    for s in data['data']['surahs']:
-        # Check if surah already exists
-        surah = Surah.query.get(s['number'])
+    try:
+        api_url = "http://api.alquran.cloud/v1/quran/en.asad"  # English + Arabic
+        response = requests.get(api_url)
+        data = response.json()
         
-        if not surah:
-            surah = Surah(
-                id=s['number'],
-                name=s['name'],
-                english_name=s['englishName'],
-                number_of_ayahs=s['numberOfAyahs'],
-                revelation_type=s['revelationType']
-            )
-            db.session.add(surah)
-        else:
-            # Update existing surah
-            surah.name = s['name']
-            surah.english_name = s['englishName']
-            surah.number_of_ayahs = s['numberOfAyahs']
-            surah.revelation_type = s['revelationType']
+        if data["status"] != "OK":
+            return jsonify({"error": "Failed to fetch Quran"}), 500
         
-        for a in s['ayahs']:
-            # Check if ayah already exists
-            ayah = Ayah.query.get(a['number'])
+        for s in data['data']['surahs']:
+            # Check if surah already exists
+            surah = Surah.query.get(s['number'])
             
-            if not ayah:
-                ayah = Ayah(
-                    id=a['number'],
-                    surah_id=s['number'],
-                    number_in_surah=a['numberInSurah'],
-                    text_arabic=a['text'],
-                    text_translation=a.get('translation', ''),
-                    juz=a.get('juz', 0)
+            if not surah:
+                surah = Surah(
+                    id=s['number'],
+                    name=s['name'],
+                    english_name=s['englishName'],
+                    number_of_ayahs=s['numberOfAyahs'],
+                    revelation_type=s['revelationType']
                 )
-                db.session.add(ayah)
+                db.session.add(surah)
             else:
-                # Update existing ayah
-                ayah.surah_id = s['number']
-                ayah.number_in_surah = a['numberInSurah']
-                ayah.text_arabic = a['text']
-                ayah.text_translation = a.get('translation', '')
-                ayah.juz = a.get('juz', 0)
+                # Update existing surah
+                surah.name = s['name']
+                surah.english_name = s['englishName']
+                surah.number_of_ayahs = s['numberOfAyahs']
+                surah.revelation_type = s['revelationType']
+            
+            db.session.commit()
+            
+            for a in s['ayahs']:
+                # Check if ayah already exists
+                ayah = Ayah.query.get(a['number'])
+                
+                if not ayah:
+                    ayah = Ayah(
+                        id=a['number'],
+                        surah_id=s['number'],
+                        number_in_surah=a['numberInSurah'],
+                        text_arabic=a['text'],
+                        text_translation=a.get('text', ''),  # Changed from 'translation' to 'text'
+                        juz=a.get('juz', 0)
+                    )
+                    db.session.add(ayah)
+                else:
+                    # Update existing ayah
+                    ayah.surah_id = s['number']
+                    ayah.number_in_surah = a['numberInSurah']
+                    ayah.text_arabic = a['text']
+                    ayah.text_translation = a.get('text', '')  # Changed from 'translation' to 'text'
+                    ayah.juz = a.get('juz', 0)
+                
+                db.session.commit()
         
-        db.session.commit()
-    
-    return jsonify({"message": "Quran data fetched and stored successfully!"})
+        return jsonify({"message": "Quran data fetched and stored successfully!"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
 
 # Get all surahs
 @app.route('/surahs', methods=['GET'])
@@ -129,6 +132,8 @@ def get_surah(surah_id):
     if not surah:
         return jsonify({"error": "Surah not found"}), 404
     
+    ayahs = Ayah.query.filter_by(surah_id=surah_id).all()
+    
     result = {
         "id": surah.id,
         "name": surah.name,
@@ -141,7 +146,7 @@ def get_surah(surah_id):
             "text_arabic": a.text_arabic,
             "text_translation": a.text_translation,
             "juz": a.juz
-        } for a in surah.ayahs]
+        } for a in ayahs]
     }
     
     return jsonify(result)
