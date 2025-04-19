@@ -95,9 +95,10 @@ def initialize_database():
         cur.close()
         conn.close()
         logger.info("Database initialized successfully")
+        return True
     except Exception as e:
         logger.error(f"Database initialization error: {str(e)}")
-        raise
+        return False
 
 def get_cached_data(cache_key: str) -> Optional[Dict]:
     """Retrieve data from cache if valid"""
@@ -149,179 +150,211 @@ def fetch_all_editions() -> List[Dict]:
     cached_data = get_cached_data(cache_key)
     
     if cached_data:
-        return cached_data["data"]
+        return cached_data.get("data", [])
     
-    response = fetch_from_api("edition")
-    if response["code"] == 200 and "data" in response:
-        editions = response["data"]
-        save_to_cache(cache_key, response)
-        return editions
-    else:
-        logger.error(f"Failed to fetch editions: {response}")
-        return []
+    try:
+        response = fetch_from_api("edition")
+        if response.get("code") == 200 and "data" in response:
+            editions = response["data"]
+            save_to_cache(cache_key, response)
+            return editions
+    except Exception as e:
+        logger.error(f"Failed to fetch editions: {str(e)}")
+    
+    return []
 
-def save_editions_to_db(editions: List[Dict]) -> None:
+def save_editions_to_db(editions: List[Dict]) -> bool:
     """Save editions to database"""
+    if not editions:
+        return False
+        
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        values = [(
-            edition["identifier"], 
-            edition["language"],
-            edition["name"], 
-            edition.get("englishName", ""), 
-            edition.get("format", ""),
-            edition.get("type", "")
-        ) for edition in editions]
+        values = []
+        for edition in editions:
+            values.append((
+                edition["identifier"], 
+                edition["language"],
+                edition["name"], 
+                edition.get("englishName", ""), 
+                edition.get("format", ""),
+                edition.get("type", "")
+            ))
         
-        execute_values(
-            cur,
-            """
-            INSERT INTO editions (identifier, language, name, english_name, format, type)
-            VALUES %s
-            ON CONFLICT (identifier) DO UPDATE SET
-                language = EXCLUDED.language,
-                name = EXCLUDED.name,
-                english_name = EXCLUDED.english_name,
-                format = EXCLUDED.format,
-                type = EXCLUDED.type
-            """,
-            values
-        )
+        if values:
+            execute_values(
+                cur,
+                """
+                INSERT INTO editions (identifier, language, name, english_name, format, type)
+                VALUES %s
+                ON CONFLICT (identifier) DO UPDATE SET
+                    language = EXCLUDED.language,
+                    name = EXCLUDED.name,
+                    english_name = EXCLUDED.english_name,
+                    format = EXCLUDED.format,
+                    type = EXCLUDED.type
+                """,
+                values
+            )
         
         conn.commit()
         cur.close()
         conn.close()
         logger.info(f"Saved {len(editions)} editions to database")
+        return True
     except Exception as e:
         logger.error(f"Error saving editions to database: {str(e)}")
-        raise
+        return False
 
 def fetch_all_surahs() -> List[Dict]:
     """Fetch all surahs metadata"""
     cache_key = "surahs"
     cached_data = get_cached_data(cache_key)
     
-    if cached_data:
+    if cached_data and "data" in cached_data and "surahs" in cached_data["data"]:
         return cached_data["data"]["surahs"]
     
-    response = fetch_from_api("meta")
-    if response["code"] == 200 and "data" in response:
-        surahs = response["data"]["surahs"]
-        save_to_cache(cache_key, response)
-        return surahs
-    else:
-        logger.error(f"Failed to fetch surahs metadata: {response}")
-        return []
+    try:
+        response = fetch_from_api("meta")
+        if response.get("code") == 200 and "data" in response and "surahs" in response["data"]:
+            surahs = response["data"]["surahs"]
+            save_to_cache(cache_key, response)
+            return surahs
+    except Exception as e:
+        logger.error(f"Failed to fetch surahs metadata: {str(e)}")
+    
+    return []
 
-def save_surahs_to_db(surahs: List[Dict]) -> None:
+def save_surahs_to_db(surahs: List[Dict]) -> bool:
     """Save surahs to database"""
+    if not surahs:
+        return False
+        
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        values = [(
-            surah["number"],
-            surah["name"],
-            surah["englishName"],
-            surah["englishNameTranslation"],
-            surah["revelationType"],
-            surah["numberOfAyahs"]
-        ) for surah in surahs]
+        values = []
+        for surah in surahs:
+            values.append((
+                surah["number"],
+                surah["name"],
+                surah["englishName"],
+                surah["englishNameTranslation"],
+                surah["revelationType"],
+                surah["numberOfAyahs"]
+            ))
         
-        execute_values(
-            cur,
-            """
-            INSERT INTO surahs (number, name, english_name, english_name_translation, revelation_type, total_verses)
-            VALUES %s
-            ON CONFLICT (number) DO UPDATE SET
-                name = EXCLUDED.name,
-                english_name = EXCLUDED.english_name,
-                english_name_translation = EXCLUDED.english_name_translation,
-                revelation_type = EXCLUDED.revelation_type,
-                total_verses = EXCLUDED.total_verses
-            """,
-            values
-        )
+        if values:
+            execute_values(
+                cur,
+                """
+                INSERT INTO surahs (number, name, english_name, english_name_translation, revelation_type, total_verses)
+                VALUES %s
+                ON CONFLICT (number) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    english_name = EXCLUDED.english_name,
+                    english_name_translation = EXCLUDED.english_name_translation,
+                    revelation_type = EXCLUDED.revelation_type,
+                    total_verses = EXCLUDED.total_verses
+                """,
+                values
+            )
         
         conn.commit()
         cur.close()
         conn.close()
         logger.info(f"Saved {len(surahs)} surahs to database")
+        return True
     except Exception as e:
         logger.error(f"Error saving surahs to database: {str(e)}")
-        raise
+        return False
 
 def fetch_surah_content(surah_number: int, edition: str = "quran-uthmani") -> Dict:
     """Fetch the content of a specific surah"""
     cache_key = f"surah_{surah_number}_{edition}"
     cached_data = get_cached_data(cache_key)
     
-    if cached_data:
+    if cached_data and "data" in cached_data:
         return cached_data["data"]
     
-    response = fetch_from_api(f"surah/{surah_number}/{edition}")
-    if response["code"] == 200 and "data" in response:
-        surah_data = response["data"]
-        save_to_cache(cache_key, response)
-        return surah_data
-    else:
-        logger.error(f"Failed to fetch surah {surah_number} content: {response}")
-        return {}
+    try:
+        response = fetch_from_api(f"surah/{surah_number}/{edition}")
+        if response.get("code") == 200 and "data" in response:
+            surah_data = response["data"]
+            save_to_cache(cache_key, response)
+            return surah_data
+    except Exception as e:
+        logger.error(f"Failed to fetch surah {surah_number} content: {str(e)}")
+    
+    return {}
 
 def fetch_surah_translation(surah_number: int, edition: str = "en.asad") -> Dict:
     """Fetch the translation of a specific surah"""
     cache_key = f"translation_{surah_number}_{edition}"
     cached_data = get_cached_data(cache_key)
     
-    if cached_data:
+    if cached_data and "data" in cached_data:
         return cached_data["data"]
     
-    response = fetch_from_api(f"surah/{surah_number}/{edition}")
-    if response["code"] == 200 and "data" in response:
-        translation_data = response["data"]
-        save_to_cache(cache_key, response)
-        return translation_data
-    else:
-        logger.error(f"Failed to fetch surah {surah_number} translation: {response}")
-        return {}
+    try:
+        response = fetch_from_api(f"surah/{surah_number}/{edition}")
+        if response.get("code") == 200 and "data" in response:
+            translation_data = response["data"]
+            save_to_cache(cache_key, response)
+            return translation_data
+    except Exception as e:
+        logger.error(f"Failed to fetch surah {surah_number} translation: {str(e)}")
+    
+    return {}
 
-def save_verses_to_db(surah_number: int, verses: List[Dict], edition: str) -> None:
+def save_verses_to_db(surah_number: int, verses: List[Dict], edition: str) -> bool:
     """Save verses to database"""
+    if not verses:
+        return False
+        
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        values = [(
-            surah_number,
-            verse["numberInSurah"],
-            verse["text"],
-            None,  # translation_text will be updated separately
-            edition
-        ) for verse in verses]
+        values = []
+        for verse in verses:
+            values.append((
+                surah_number,
+                verse["numberInSurah"],
+                verse["text"],
+                None,  # translation_text will be updated separately
+                edition
+            ))
         
-        execute_values(
-            cur,
-            """
-            INSERT INTO verses (surah_number, verse_number, arabic_text, translation_text, translation_edition)
-            VALUES %s
-            ON CONFLICT (surah_number, verse_number, translation_edition) DO UPDATE SET
-                arabic_text = EXCLUDED.arabic_text
-            """,
-            values
-        )
+        if values:
+            execute_values(
+                cur,
+                """
+                INSERT INTO verses (surah_number, verse_number, arabic_text, translation_text, translation_edition)
+                VALUES %s
+                ON CONFLICT (surah_number, verse_number, translation_edition) DO UPDATE SET
+                    arabic_text = EXCLUDED.arabic_text
+                """,
+                values
+            )
         
         conn.commit()
         cur.close()
         conn.close()
         logger.info(f"Saved {len(verses)} verses from surah {surah_number} to database")
+        return True
     except Exception as e:
         logger.error(f"Error saving verses to database: {str(e)}")
-        raise
+        return False
 
-def save_translations_to_db(surah_number: int, translations: List[Dict], edition: str) -> None:
+def save_translations_to_db(surah_number: int, translations: List[Dict], edition: str) -> bool:
     """Save verse translations to database"""
+    if not translations:
+        return False
+        
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -340,23 +373,27 @@ def save_translations_to_db(surah_number: int, translations: List[Dict], edition
         cur.close()
         conn.close()
         logger.info(f"Saved {len(translations)} translations for surah {surah_number} to database")
+        return True
     except Exception as e:
         logger.error(f"Error saving translations to database: {str(e)}")
-        raise
+        return False
 
 def fetch_and_save_all_data():
     """Fetch and save all Quran data to the database"""
     try:
         # Initialize database tables
-        initialize_database()
+        if not initialize_database():
+            return {"status": "error", "message": "Failed to initialize database"}
         
         # Fetch and save editions
         editions = fetch_all_editions()
-        save_editions_to_db(editions)
+        if not save_editions_to_db(editions):
+            return {"status": "error", "message": "Failed to save editions to database"}
         
         # Fetch and save surahs metadata
         surahs = fetch_all_surahs()
-        save_surahs_to_db(surahs)
+        if not save_surahs_to_db(surahs):
+            return {"status": "error", "message": "Failed to save surahs to database"}
         
         # Define the editions to fetch
         arabic_edition = "quran-uthmani"
@@ -410,23 +447,33 @@ def sync_all():
 def sync_editions():
     try:
         editions = fetch_all_editions()
-        save_editions_to_db(editions)
-        return jsonify({"status": "success", "message": f"Synced {len(editions)} editions"})
+        if save_editions_to_db(editions):
+            return jsonify({"status": "success", "message": f"Synced {len(editions)} editions"})
+        else:
+            return jsonify({"status": "error", "message": "Failed to save editions to database"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
 @app.route('/sync/surahs')
 def sync_surahs():
     try:
+        # Make sure tables exist first
+        initialize_database()
+        
         surahs = fetch_all_surahs()
-        save_surahs_to_db(surahs)
-        return jsonify({"status": "success", "message": f"Synced {len(surahs)} surahs"})
+        if save_surahs_to_db(surahs):
+            return jsonify({"status": "success", "message": f"Synced {len(surahs)} surahs"})
+        else:
+            return jsonify({"status": "error", "message": "Failed to save surahs to database"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
 @app.route('/sync/surah/<int:surah_number>')
 def sync_surah(surah_number):
     try:
+        # Make sure tables exist first
+        initialize_database()
+        
         arabic_edition = request.args.get('arabic', 'quran-uthmani')
         translation_edition = request.args.get('translation', 'en.asad')
         
@@ -472,6 +519,9 @@ def get_surah_api(surah_number):
         
         # Get surah info
         cur.execute("SELECT * FROM surahs WHERE number = %s", (surah_number,))
+        if cur.rowcount == 0:
+            return jsonify({"status": "error", "message": f"Surah {surah_number} not found"}), 404
+            
         surah_columns = [desc[0] for desc in cur.description]
         surah_data = dict(zip(surah_columns, cur.fetchone()))
         
@@ -513,16 +563,16 @@ def get_verse_api(surah_number, verse_number):
             (surah_number, verse_number, edition)
         )
         
+        if cur.rowcount == 0:
+            return jsonify({"status": "error", "message": f"Verse {surah_number}:{verse_number} not found"}), 404
+            
         result_columns = [desc[0] for desc in cur.description]
-        verse_data = dict(zip(result_columns, cur.fetchone())) if cur.rowcount > 0 else None
+        verse_data = dict(zip(result_columns, cur.fetchone()))
         
         cur.close()
         conn.close()
         
-        if verse_data:
-            return jsonify({"status": "success", "data": verse_data})
-        else:
-            return jsonify({"status": "error", "message": "Verse not found"}), 404
+        return jsonify({"status": "success", "data": verse_data})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
