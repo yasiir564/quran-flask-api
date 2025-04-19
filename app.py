@@ -4,6 +4,7 @@ import time
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Union
+import math
 
 import psycopg2
 from psycopg2.extras import execute_values
@@ -35,6 +36,10 @@ DB_CONNECTION_STRING = "postgresql://Quran%20Db_owner:npg_2sdeOXQArcY8@ep-sparkl
 
 # API endpoints
 ALQURAN_API_BASE_URL = "https://api.alquran.cloud/v1"
+
+# Partitioning constants for database tables
+SURAHS_PER_TABLE = 50  # Max 50 surahs per table
+VERSES_PER_TABLE = 1000  # Adjust this value based on your needs
 
 # Ensure cache directory exists
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -92,6 +97,22 @@ def fetch_from_api(endpoint: str, params: Dict = None) -> Dict:
                 logger.error(f"Failed to fetch from API after {retries} attempts")
                 raise
 
+def get_surahs_table_name(partition: int) -> str:
+    """Get the appropriate table name for a surah partition"""
+    return f"surahs_p{partition}"
+
+def get_verses_table_name(partition: int) -> str:
+    """Get the appropriate table name for a verses partition"""
+    return f"verses_p{partition}"
+
+def get_partition_for_surah(surah_number: int) -> int:
+    """Calculate which partition a surah belongs to"""
+    return math.ceil(surah_number / SURAHS_PER_TABLE)
+
+def get_partition_for_verse(surah_number: int) -> int:
+    """Calculate which partition a verse belongs to based on surah number"""
+    return get_partition_for_surah(surah_number)
+
 def initialize_database():
     """Create necessary tables if they don't exist"""
     conn = None
@@ -100,32 +121,11 @@ def initialize_database():
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Create Surahs table
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS surahs (
-            number INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            english_name TEXT NOT NULL,
-            english_name_translation TEXT,
-            revelation_type TEXT,
-            total_verses INTEGER
-        )
-        """)
+        # Get total number of surahs from API or use the known value 114
+        total_surahs = 114
+        num_surah_partitions = math.ceil(total_surahs / SURAHS_PER_TABLE)
         
-        # Create Verses table
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS verses (
-            id SERIAL PRIMARY KEY,
-            surah_number INTEGER REFERENCES surahs(number),
-            verse_number INTEGER NOT NULL,
-            arabic_text TEXT NOT NULL,
-            translation_text TEXT,
-            translation_edition TEXT,
-            UNIQUE(surah_number, verse_number, translation_edition)
-        )
-        """)
-        
-        # Create Editions table
+        # Create Editions table (small table, no partitioning needed)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS editions (
             identifier TEXT PRIMARY KEY,
@@ -137,8 +137,59 @@ def initialize_database():
         )
         """)
         
+        # Create partition tables for surahs
+        for p in range(1, num_surah_partitions + 1):
+            table_name = get_surahs_table_name(p)
+            cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                number INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                english_name TEXT NOT NULL,
+                english_name_translation TEXT,
+                revelation_type TEXT,
+                total_verses INTEGER
+            )
+            """)
+            logger.info(f"Created or verified surah partition table: {table_name}")
+        
+        # Create partition tables for verses
+        for p in range(1, num_surah_partitions + 1):
+            table_name = get_verses_table_name(p)
+            cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                id SERIAL PRIMARY KEY,
+                surah_number INTEGER NOT NULL,
+                verse_number INTEGER NOT NULL,
+                arabic_text TEXT NOT NULL,
+                translation_text TEXT,
+                translation_edition TEXT,
+                UNIQUE(surah_number, verse_number, translation_edition)
+            )
+            """)
+            logger.info(f"Created or verified verses partition table: {table_name}")
+        
+        # Create a view to unify all surah partitions for easier querying
+        partition_queries = [f"SELECT * FROM {get_surahs_table_name(p)}" for p in range(1, num_surah_partitions + 1)]
+        unified_query = " UNION ALL ".join(partition_queries)
+        
+        cur.execute(f"""
+        CREATE OR REPLACE VIEW surahs AS
+        {unified_query}
+        """)
+        logger.info("Created or replaced unified surahs view")
+        
+        # Create a view to unify all verse partitions
+        verse_partition_queries = [f"SELECT * FROM {get_verses_table_name(p)}" for p in range(1, num_surah_partitions + 1)]
+        unified_verse_query = " UNION ALL ".join(verse_partition_queries)
+        
+        cur.execute(f"""
+        CREATE OR REPLACE VIEW verses AS
+        {unified_verse_query}
+        """)
+        logger.info("Created or replaced unified verses view")
+        
         conn.commit()
-        logger.info("Database initialized successfully")
+        logger.info("Database initialized successfully with partition tables")
         return True
     except Exception as e:
         logger.error(f"Database initialization error: {str(e)}")
@@ -273,26 +324,27 @@ def fetch_all_surahs() -> List[Dict]:
     return []
 
 def save_surahs_to_db(surahs: List[Dict]) -> bool:
-    """Save surahs to database"""
+    """Save surahs to database with partitioning"""
     if not surahs:
         logger.warning("No surahs data to save")
         return False
-        
+    
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Log the shape of the data to help diagnose issues
-        logger.info(f"Attempting to save {len(surahs)} surahs to database")
-        if surahs and len(surahs) > 0:
-            logger.info(f"Sample surah data keys: {list(surahs[0].keys())}")
-        
-        values = []
+        # Group surahs by partition
+        partition_data = {}
         for surah in surahs:
             try:
-                # Handle potential missing keys more gracefully
-                values.append((
-                    surah.get("number", 0),
+                surah_number = surah.get("number", 0)
+                partition = get_partition_for_surah(surah_number)
+                
+                if partition not in partition_data:
+                    partition_data[partition] = []
+                
+                partition_data[partition].append((
+                    surah_number,
                     surah.get("name", ""),
                     surah.get("englishName", ""),
                     surah.get("englishNameTranslation", ""),
@@ -301,35 +353,42 @@ def save_surahs_to_db(surahs: List[Dict]) -> bool:
                 ))
             except Exception as e:
                 logger.error(f"Error processing surah: {str(e)}, surah data: {surah}")
-                # Continue with other surahs instead of failing completely
         
-        if values:
-            try:
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO surahs (number, name, english_name, english_name_translation, revelation_type, total_verses)
-                    VALUES %s
-                    ON CONFLICT (number) DO UPDATE SET
-                        name = EXCLUDED.name,
-                        english_name = EXCLUDED.english_name,
-                        english_name_translation = EXCLUDED.english_name_translation,
-                        revelation_type = EXCLUDED.revelation_type,
-                        total_verses = EXCLUDED.total_verses
-                    """,
-                    values
-                )
-                conn.commit()
-                logger.info(f"Successfully saved {len(values)} surahs to database")
-            except Exception as e:
-                conn.rollback()
-                logger.error(f"Database error when executing insert: {str(e)}")
-                if hasattr(e, 'pgerror') and e.pgerror:
-                    logger.error(f"PostgreSQL error details: {e.pgerror}")
-                raise
+        # Insert into each partition table
+        total_surahs_saved = 0
+        for partition, values in partition_data.items():
+            if values:
+                table_name = get_surahs_table_name(partition)
+                logger.info(f"Saving {len(values)} surahs to partition table {table_name}")
+                
+                try:
+                    execute_values(
+                        cur,
+                        f"""
+                        INSERT INTO {table_name} 
+                        (number, name, english_name, english_name_translation, revelation_type, total_verses)
+                        VALUES %s
+                        ON CONFLICT (number) DO UPDATE SET
+                            name = EXCLUDED.name,
+                            english_name = EXCLUDED.english_name,
+                            english_name_translation = EXCLUDED.english_name_translation,
+                            revelation_type = EXCLUDED.revelation_type,
+                            total_verses = EXCLUDED.total_verses
+                        """,
+                        values
+                    )
+                    total_surahs_saved += len(values)
+                except Exception as e:
+                    conn.rollback()
+                    logger.error(f"Database error when inserting into {table_name}: {str(e)}")
+                    if hasattr(e, 'pgerror') and e.pgerror:
+                        logger.error(f"PostgreSQL error details: {e.pgerror}")
+                    raise
         
+        conn.commit()
         cur.close()
         conn.close()
+        logger.info(f"Successfully saved {total_surahs_saved} surahs across partition tables")
         return True
     except Exception as e:
         logger.error(f"Error saving surahs to database: {str(e)}")
@@ -374,19 +433,20 @@ def fetch_surah_translation(surah_number: int, edition: str = "en.asad") -> Dict
     return {}
 
 def save_verses_to_db(surah_number: int, verses: List[Dict], edition: str) -> bool:
-    """Save verses to database"""
+    """Save verses to database with partitioning"""
     if not verses:
         logger.warning(f"No verses data to save for surah {surah_number}")
         return False
-        
+    
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Log the shape of the data
-        logger.info(f"Attempting to save {len(verses)} verses for surah {surah_number} to database")
-        if verses and len(verses) > 0:
-            logger.info(f"Sample verse data keys: {list(verses[0].keys())}")
+        # Calculate which partition this surah belongs to
+        partition = get_partition_for_verse(surah_number)
+        table_name = get_verses_table_name(partition)
+        
+        logger.info(f"Saving {len(verses)} verses for surah {surah_number} to partition table {table_name}")
         
         values = []
         for verse in verses:
@@ -400,14 +460,14 @@ def save_verses_to_db(surah_number: int, verses: List[Dict], edition: str) -> bo
                 ))
             except Exception as e:
                 logger.error(f"Error processing verse: {str(e)}, verse data: {verse}")
-                # Continue with other verses
         
         if values:
             try:
                 execute_values(
                     cur,
-                    """
-                    INSERT INTO verses (surah_number, verse_number, arabic_text, translation_text, translation_edition)
+                    f"""
+                    INSERT INTO {table_name} 
+                    (surah_number, verse_number, arabic_text, translation_text, translation_edition)
                     VALUES %s
                     ON CONFLICT (surah_number, verse_number, translation_edition) DO UPDATE SET
                         arabic_text = EXCLUDED.arabic_text
@@ -415,10 +475,10 @@ def save_verses_to_db(surah_number: int, verses: List[Dict], edition: str) -> bo
                     values
                 )
                 conn.commit()
-                logger.info(f"Successfully saved {len(values)} verses from surah {surah_number} to database")
+                logger.info(f"Successfully saved {len(values)} verses from surah {surah_number} to partition table {table_name}")
             except Exception as e:
                 conn.rollback()
-                logger.error(f"Database error when executing insert: {str(e)}")
+                logger.error(f"Database error when inserting into {table_name}: {str(e)}")
                 if hasattr(e, 'pgerror') and e.pgerror:
                     logger.error(f"PostgreSQL error details: {e.pgerror}")
                 raise
@@ -431,17 +491,20 @@ def save_verses_to_db(surah_number: int, verses: List[Dict], edition: str) -> bo
         return False
 
 def save_translations_to_db(surah_number: int, translations: List[Dict], edition: str) -> bool:
-    """Save verse translations to database"""
+    """Save verse translations to database with partitioning"""
     if not translations:
         logger.warning(f"No translation data to save for surah {surah_number}")
         return False
-        
+    
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Log and handle data more robustly
-        logger.info(f"Attempting to save {len(translations)} translations for surah {surah_number}")
+        # Calculate which partition this surah belongs to
+        partition = get_partition_for_verse(surah_number)
+        table_name = get_verses_table_name(partition)
+        
+        logger.info(f"Updating {len(translations)} translations for surah {surah_number} in partition table {table_name}")
         
         update_count = 0
         error_count = 0
@@ -449,8 +512,8 @@ def save_translations_to_db(surah_number: int, translations: List[Dict], edition
         for verse in translations:
             try:
                 cur.execute(
-                    """
-                    UPDATE verses 
+                    f"""
+                    UPDATE {table_name}
                     SET translation_text = %s
                     WHERE surah_number = %s AND verse_number = %s AND translation_edition = %s
                     """,
@@ -514,12 +577,120 @@ def fetch_and_save_all_data():
         logger.error(f"Error in fetch_and_save_all_data: {str(e)}")
         return {"status": "error", "message": str(e)}
 
+def get_surah_by_number(surah_number: int) -> Optional[Dict]:
+    """Get surah data from the appropriate partition table"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        partition = get_partition_for_surah(surah_number)
+        table_name = get_surahs_table_name(partition)
+        
+        cur.execute(f"SELECT * FROM {table_name} WHERE number = %s", (surah_number,))
+        if cur.rowcount == 0:
+            return None
+        
+        columns = [desc[0] for desc in cur.description]
+        surah_data = dict(zip(columns, cur.fetchone()))
+        
+        cur.close()
+        conn.close()
+        
+        return surah_data
+    except Exception as e:
+        logger.error(f"Error getting surah {surah_number}: {str(e)}")
+        return None
+
+def get_verses_for_surah(surah_number: int, edition: str) -> List[Dict]:
+    """Get verses for a surah from the appropriate partition table"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        partition = get_partition_for_verse(surah_number)
+        table_name = get_verses_table_name(partition)
+        
+        cur.execute(
+            f"""
+            SELECT * FROM {table_name}
+            WHERE surah_number = %s AND translation_edition = %s
+            ORDER BY verse_number
+            """,
+            (surah_number, edition)
+        )
+        
+        columns = [desc[0] for desc in cur.description]
+        verses = [dict(zip(columns, row)) for row in cur.fetchall()]
+        
+        cur.close()
+        conn.close()
+        
+        return verses
+    except Exception as e:
+        logger.error(f"Error getting verses for surah {surah_number}: {str(e)}")
+        return []
+
+def get_all_surahs() -> List[Dict]:
+    """Get all surahs from all partition tables"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Use the view to get all surahs
+        cur.execute("SELECT * FROM surahs ORDER BY number")
+        
+        columns = [desc[0] for desc in cur.description]
+        surahs = [dict(zip(columns, row)) for row in cur.fetchall()]
+        
+        cur.close()
+        conn.close()
+        
+        return surahs
+    except Exception as e:
+        logger.error(f"Error getting all surahs: {str(e)}")
+        return []
+
+def get_verse_by_numbers(surah_number: int, verse_number: int, edition: str) -> Optional[Dict]:
+    """Get a specific verse from the appropriate partition table"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        partition = get_partition_for_verse(surah_number)
+        verses_table = get_verses_table_name(partition)
+        partition_surah = get_partition_for_surah(surah_number)
+        surahs_table = get_surahs_table_name(partition_surah)
+        
+        cur.execute(
+            f"""
+            SELECT v.*, s.name, s.english_name, s.english_name_translation 
+            FROM {verses_table} v
+            JOIN {surahs_table} s ON v.surah_number = s.number
+            WHERE v.surah_number = %s AND v.verse_number = %s AND v.translation_edition = %s
+            """,
+            (surah_number, verse_number, edition)
+        )
+        
+        if cur.rowcount == 0:
+            return None
+        
+        columns = [desc[0] for desc in cur.description]
+        verse_data = dict(zip(columns, cur.fetchone()))
+        
+        cur.close()
+        conn.close()
+        
+        return verse_data
+    except Exception as e:
+        logger.error(f"Error getting verse {surah_number}:{verse_number}: {str(e)}")
+        return None
+
 # API Routes
 @app.route('/')
 def home():
     return jsonify({
         "status": "success",
-        "message": "AlQuran API Database Sync Service",
+        "message": "AlQuran API Database Sync Service (Partitioned)",
         "endpoints": [
             "/sync/all - Sync all data",
             "/sync/editions - Sync editions",
@@ -527,7 +698,8 @@ def home():
             "/sync/surah/<number> - Sync specific surah content",
             "/api/surahs - Get all surahs",
             "/api/surah/<number> - Get specific surah with verses",
-            "/api/verse/<surah>/<verse> - Get specific verse"
+            "/api/verse/<surah>/<verse> - Get specific verse",
+            "/health - Health check endpoint"
         ]
     })
 
@@ -596,17 +768,8 @@ def sync_surah(surah_number):
 @app.route('/api/surahs')
 def get_surahs_api():
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        cur.execute("SELECT * FROM surahs ORDER BY number")
-        columns = [desc[0] for desc in cur.description]
-        result = [dict(zip(columns, row)) for row in cur.fetchall()]
-        
-        cur.close()
-        conn.close()
-        
-        return jsonify({"status": "success", "data": result})
+        surahs = get_all_surahs()
+        return jsonify({"status": "success", "data": surahs})
     except Exception as e:
         logger.error(f"Error getting surahs: {str(e)}")
         return jsonify({"status": "error", "message": str(e)})
@@ -614,82 +777,103 @@ def get_surahs_api():
 @app.route('/api/surah/<int:surah_number>')
 def get_surah_api(surah_number):
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Get surah info
-        cur.execute("SELECT * FROM surahs WHERE number = %s", (surah_number,))
-        if cur.rowcount == 0:
-            return jsonify({"status": "error", "message": f"Surah {surah_number} not found"}), 404
-            
-        surah_columns = [desc[0] for desc in cur.description]
-        surah_data = dict(zip(surah_columns, cur.fetchone()))
-        
-        # Get verses
         edition = request.args.get('edition', 'quran-uthmani')
-        cur.execute(
-            """
-            SELECT * FROM verses 
-            WHERE surah_number = %s AND translation_edition = %s
-            ORDER BY verse_number
-            """, 
-            (surah_number, edition)
-        )
-        verse_columns = [desc[0] for desc in cur.description]
-        verses = [dict(zip(verse_columns, row)) for row in cur.fetchall()]
         
-        cur.close()
-        conn.close()
+        # Get surah metadata
+        surah = get_surah_by_number(surah_number)
+        if not surah:
+            return jsonify({"status": "error", "message": f"Surah {surah_number} not found"}), 404
         
-        surah_data["verses"] = verses
-        return jsonify({"status": "success", "data": surah_data})
+        # Get verses for the surah
+        verses = get_verses_for_surah(surah_number, edition)
+        
+        # Combine metadata and verses
+        result = {
+            "status": "success",
+            "data": {
+                "surah": surah,
+                "verses": verses
+            }
+        }
+        
+        return jsonify(result)
     except Exception as e:
         logger.error(f"Error getting surah {surah_number}: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)})
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/verse/<int:surah_number>/<int:verse_number>')
 def get_verse_api(surah_number, verse_number):
     try:
+        edition = request.args.get('edition', 'quran-uthmani')
+        
+        verse = get_verse_by_numbers(surah_number, verse_number, edition)
+        if not verse:
+            return jsonify({"status": "error", "message": f"Verse {surah_number}:{verse_number} not found"}), 404
+        
+        return jsonify({"status": "success", "data": verse})
+    except Exception as e:
+        logger.error(f"Error getting verse {surah_number}:{verse_number}: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/search')
+def search_verses():
+    try:
+        query = request.args.get('q', '').strip()
+        edition = request.args.get('edition', 'quran-uthmani')
+        
+        if not query:
+            return jsonify({"status": "error", "message": "Search query is required"}), 400
+        
         conn = get_db_connection()
         cur = conn.cursor()
         
-        edition = request.args.get('edition', 'quran-uthmani')
+        # Search across all partition tables using the unified view
         cur.execute(
             """
             SELECT v.*, s.name, s.english_name, s.english_name_translation 
             FROM verses v
             JOIN surahs s ON v.surah_number = s.number
-            WHERE v.surah_number = %s AND v.verse_number = %s AND v.translation_edition = %s
-            """, 
-            (surah_number, verse_number, edition)
+            WHERE v.translation_edition = %s AND 
+            (v.arabic_text LIKE %s OR v.translation_text LIKE %s)
+            ORDER BY v.surah_number, v.verse_number
+            LIMIT 100
+            """,
+            (edition, f"%{query}%", f"%{query}%")
         )
         
-        if cur.rowcount == 0:
-            return jsonify({"status": "error", "message": f"Verse {surah_number}:{verse_number} not found"}), 404
-            
-        result_columns = [desc[0] for desc in cur.description]
-        verse_data = dict(zip(result_columns, cur.fetchone()))
+        columns = [desc[0] for desc in cur.description]
+        results = [dict(zip(columns, row)) for row in cur.fetchall()]
         
         cur.close()
         conn.close()
         
-        return jsonify({"status": "success", "data": verse_data})
+        return jsonify({"status": "success", "data": results})
     except Exception as e:
-        logger.error(f"Error getting verse {surah_number}:{verse_number}: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)})
+        logger.error(f"Error searching verses with query '{query}': {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/health')
 def health_check():
-    """Health check endpoint for service monitoring"""
     try:
-        # Check database connection
+        # Quick DB connection test
         conn = get_db_connection()
-        conn.cursor().execute("SELECT 1")
         conn.close()
+        
+        # Check if we have editions in cache
+        editions_cache = get_cached_data("editions")
+        editions_cached = editions_cache is not None
+        
+        # Check if we have surahs in cache
+        surahs_cache = get_cached_data("surahs")
+        surahs_cached = surahs_cache is not None
         
         return jsonify({
             "status": "healthy",
             "database": "connected",
+            "cache": {
+                "editions": editions_cached,
+                "surahs": surahs_cached
+            },
             "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
@@ -700,10 +884,88 @@ def health_check():
             "timestamp": datetime.now().isoformat()
         }), 500
 
+@app.route('/api/editions')
+def get_editions_api():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute("SELECT * FROM editions ORDER BY language, english_name")
+        
+        columns = [desc[0] for desc in cur.description]
+        editions = [dict(zip(columns, row)) for row in cur.fetchall()]
+        
+        cur.close()
+        conn.close()
+        
+        return jsonify({"status": "success", "data": editions})
+    except Exception as e:
+        logger.error(f"Error getting editions: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/random')
+def get_random_verse():
+    try:
+        edition = request.args.get('edition', 'quran-uthmani')
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Get random verse using the unified view
+        cur.execute(
+            """
+            SELECT v.*, s.name, s.english_name, s.english_name_translation 
+            FROM verses v
+            JOIN surahs s ON v.surah_number = s.number
+            WHERE v.translation_edition = %s
+            ORDER BY RANDOM()
+            LIMIT 1
+            """,
+            (edition,)
+        )
+        
+        if cur.rowcount == 0:
+            return jsonify({"status": "error", "message": "No verses found"}), 404
+        
+        columns = [desc[0] for desc in cur.description]
+        verse = dict(zip(columns, cur.fetchone()))
+        
+        cur.close()
+        conn.close()
+        
+        return jsonify({"status": "success", "data": verse})
+    except Exception as e:
+        logger.error(f"Error getting random verse: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"status": "error", "message": "Endpoint not found"}), 404
+
+@app.errorhandler(500)
+def server_error(error):
+    return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+# Main entry point
 if __name__ == '__main__':
-    # Initialize database on startup
-    initialize_database()
-    
-    # Get port from environment variable for deployment
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    try:
+        # Initial database setup
+        initialize_database()
+        
+        # Check if we need to do an initial data load
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM editions")
+        editions_count = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        
+        if editions_count == 0:
+            logger.info("No editions found in database. Starting initial data sync...")
+            fetch_and_save_all_data()
+        
+        # Start the Flask server
+        port = int(os.environ.get('PORT', 5000))
+        app.run(host='0.0.0.0', port=port, debug=False)
+    except Exception as e:
+        logger.critical(f"Failed to start application: {str(e)}")
