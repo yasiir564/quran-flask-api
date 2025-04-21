@@ -1,2 +1,6 @@
-flask
+Flask
+Werkzeug
+flask-cors
 playwright
+requests
+gunicorn
