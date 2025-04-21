@@ -1,149 +1,152 @@
+from flask import Flask, request, jsonify, current_app
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import re
+import logging
+from functools import wraps
 import os
-import uuid
-import subprocess
-import librosa
-import numpy as np
-import soundfile as sf
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
+from urllib.parse import urlparse
 
-try:
-    from voicefixer import VoiceFixer
-except ImportError:
-    VoiceFixer = None  # fallback if not installed
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
-import tempfile
+# Configuration
+class Config:
+    DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
+    HOST = os.environ.get('HOST', '0.0.0.0')
+    PORT = int(os.environ.get('PORT', 5000))
+    TIMEOUT_NAVIGATION = int(os.environ.get('TIMEOUT_NAVIGATION', 60000))
+    TIMEOUT_SELECTOR = int(os.environ.get('TIMEOUT_SELECTOR', 10000))
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/117.0.0.0 Safari/537.36"
+    )
 
-app = Flask(__name__)
-CORS(app)
-
-# Initialize VoiceFixer if available
-voice_fixer = VoiceFixer() if VoiceFixer else None
-
-# Create upload/output folders
-UPLOAD_FOLDER = 'uploads'
-OUTPUT_FOLDER = 'outputs'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({"status": "healthy"}), 200
-
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
+# Create the Flask application
+def create_app(config=Config):
+    app = Flask(__name__)
+    app.config.from_object(config)
     
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
+    # Error handlers
+    @app.errorhandler(404)
+    def not_found(error):
+        return jsonify({"error": "Not found"}), 404
+
+    @app.errorhandler(500)
+    def server_error(error):
+        return jsonify({"error": "Internal server error"}), 500
     
-    filename = str(uuid.uuid4()) + os.path.splitext(file.filename)[1]
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(file_path)
+    # Rate limiting decorator
+    def limit_content_length(max_length):
+        def decorator(f):
+            @wraps(f)
+            def wrapper(*args, **kwargs):
+                cl = request.content_length
+                if cl and cl > max_length:
+                    return jsonify({"error": "Content too large"}), 413
+                return f(*args, **kwargs)
+            return wrapper
+        return decorator
     
-    return jsonify({"filename": filename}), 200
+    # Routes
+    @app.route('/download', methods=['POST'])
+    @limit_content_length(1024 * 10)  # 10KB max request size
+    def download_video():
+        if not request.is_json:
+            return jsonify({"error": "Request must be JSON"}), 400
+        
+        data = request.json
+        tiktok_url = data.get('url')
+        
+        # Validate URL
+        if not tiktok_url:
+            return jsonify({"error": "Missing TikTok URL"}), 400
+        
+        # Validate TikTok domain
+        parsed_url = urlparse(tiktok_url)
+        if not parsed_url.netloc or not (
+            parsed_url.netloc.endswith('tiktok.com') or 
+            parsed_url.netloc.endswith('vm.tiktok.com')
+        ):
+            return jsonify({"error": "Invalid TikTok URL"}), 400
+        
+        try:
+            download_url = extract_tiktok_video_url(tiktok_url)
+            return jsonify({"download_url": download_url})
+        except PlaywrightTimeoutError as e:
+            logger.error(f"Timeout error: {str(e)}")
+            return jsonify({"error": "Timed out while processing the video"}), 408
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+            return jsonify({"error": "Failed to process video"}), 500
+    
+    return app
 
-@app.route('/transform', methods=['POST'])
-def transform_voice():
-    data = request.json
-    filename = data.get('filename')
-    transformation = data.get('transformation', 'fix')
+def extract_tiktok_video_url(tiktok_url):
+    """Extract download URL from TikTok page"""
+    logger.info(f"Processing TikTok URL: {tiktok_url}")
+    
+    with sync_playwright() as p:
+        browser = None
+        try:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=current_app.config['USER_AGENT'],
+                viewport={"width": 1280, "height": 720}
+            )
+            
+            # Block unnecessary resources to improve performance
+            context.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2}", lambda route: route.abort())
+            
+            page = context.new_page()
+            
+            logger.info("Navigating to TikTok page")
+            page.goto(
+                tiktok_url, 
+                timeout=current_app.config['TIMEOUT_NAVIGATION'],
+                wait_until="domcontentloaded"
+            )
+            
+            logger.info("Waiting for video element")
+            page.wait_for_selector("video", timeout=current_app.config['TIMEOUT_SELECTOR'])
+            
+            html = page.content()
+            
+            # Try multiple regex patterns to find the download URL
+            patterns = [
+                r'"downloadAddr":"([^"]+)"',
+                r'"playAddr":"([^"]+)"',
+                r'playAddr="([^"]+)"',
+                r'<video[^>]+src="([^"]+)"'
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, html)
+                if match:
+                    download_url = match.group(1).replace("\\u0026", "&").replace("\\", "")
+                    logger.info(f"Found download URL with pattern: {pattern}")
+                    return download_url
+            
+            # If we get here, we didn't find a download URL
+            logger.error("No video URL pattern matched")
+            raise ValueError("Could not extract video URL")
+            
+        finally:
+            if browser:
+                browser.close()
 
-    if not filename:
-        return jsonify({"error": "No filename provided"}), 400
-
-    input_path = os.path.join(UPLOAD_FOLDER, filename)
-    if not os.path.exists(input_path):
-        return jsonify({"error": "File not found"}), 404
-
-    output_filename = f"transformed_{transformation}_{filename}"
-    output_path = os.path.join(OUTPUT_FOLDER, output_filename)
-
-    try:
-        if transformation == 'fix':
-            if voice_fixer:
-                voice_fixer.restore(input_path, output_path)
-            else:
-                return jsonify({"error": "VoiceFixer is not installed"}), 500
-
-        elif transformation == 'deeper':
-            y, sr = librosa.load(input_path, sr=None)
-            y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=-3)
-            sf.write(output_path, y_shifted, sr)
-
-        elif transformation == 'higher':
-            y, sr = librosa.load(input_path, sr=None)
-            y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=3)
-            sf.write(output_path, y_shifted, sr)
-
-        elif transformation == 'robotic':
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-            temp_file.close()
-
-            input_file = input_path
-            if not input_path.endswith('.wav'):
-                subprocess.run([
-                    'ffmpeg', '-i', input_path, '-acodec', 'pcm_s16le',
-                    '-ar', '44100', temp_file.name
-                ], check=True)
-                input_file = temp_file.name
-
-            subprocess.run([
-                'ffmpeg', '-i', input_file, '-af',
-                'aecho=0.8:0.88:60:0.4,asetrate=44100*1.3,aresample=44100,atempo=1.1',
-                '-y', output_path
-            ], check=True)
-
-            if os.path.exists(temp_file.name):
-                os.unlink(temp_file.name)
-
-        elif transformation == 'echo':
-            subprocess.run([
-                'ffmpeg', '-i', input_path, '-af',
-                'aecho=0.8:0.9:1000:0.3', '-y', output_path
-            ], check=True)
-
-        elif transformation == 'whisper':
-            y, sr = librosa.load(input_path, sr=None)
-            y_whisper = y * 0.3
-            noise = np.random.normal(0, 0.005, y_whisper.shape)
-            y_whisper += noise
-            sf.write(output_path, y_whisper, sr)
-
-        else:
-            return jsonify({"error": f"Unsupported transformation: {transformation}"}), 400
-
-        return jsonify({
-            "output_filename": output_filename,
-            "transformation": transformation
-        }), 200
-
-    except subprocess.CalledProcessError as e:
-        return jsonify({"error": f"FFmpeg error: {str(e)}"}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/download/<filename>', methods=['GET'])
-def download_file(filename):
-    output_path = os.path.join(OUTPUT_FOLDER, filename)
-    if not os.path.exists(output_path):
-        return jsonify({"error": "File not found"}), 404
-
-    return send_file(output_path, as_attachment=True)
-
-@app.route('/transformations', methods=['GET'])
-def get_transformations():
-    return jsonify([
-        {"id": "fix", "name": "Fix Audio Quality"},
-        {"id": "deeper", "name": "Deeper Voice"},
-        {"id": "higher", "name": "Higher Voice"},
-        {"id": "robotic", "name": "Robotic Voice"},
-        {"id": "echo", "name": "Echo Effect"},
-        {"id": "whisper", "name": "Whisper Effect"}
-    ])
-
+# Run the application
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app = create_app()
+    app.run(
+        host=app.config['HOST'],
+        port=app.config['PORT'],
+        debug=app.config['DEBUG']
+    )
