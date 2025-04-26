@@ -11,3 +11,4 @@ lxml==4.9.3
 starlette==0.27.0
 python-dotenv==1.0.0
 logging==0.4.9.6
+gunicorn
