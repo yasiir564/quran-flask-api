@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 import httpx
 from bs4 import BeautifulSoup
@@ -10,17 +11,23 @@ import asyncio
 import logging
 import m3u8
 from urllib.parse import urlparse, parse_qs
-import aiohttp
-from io import BytesIO
 import time
-from typing import List, Dict, Any, Optional, Union
-import base64
+from typing import List, Dict, Any, Optional
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Enhanced TikTok Downloader API")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 # Free proxy rotation list - add more as needed
 PROXY_LIST = [
@@ -64,8 +71,13 @@ def standardize_tiktok_url(url: str) -> str:
     
     # Handle TikTok short URLs (vm.tiktok.com, vt.tiktok.com)
     if parsed_url.netloc in ['vm.tiktok.com', 'vt.tiktok.com']:
-        response = httpx.head(url, follow_redirects=True)
-        return response.url
+        try:
+            with httpx.Client(follow_redirects=True) as client:
+                response = client.head(url)
+                return str(response.url)
+        except Exception as e:
+            logger.error(f"Error following redirect for short URL: {e}")
+            return url
     
     # Handle mobile URLs
     if 'm.tiktok.com' in parsed_url.netloc:
@@ -111,8 +123,6 @@ async def extract_m3u8_streams(url: str) -> List[Dict[str, Any]]:
 
 async def download_tiktok_no_watermark(video_url: str) -> str:
     """Generate a no-watermark download URL for TikTok videos."""
-    # This is a simplified approach - in a production environment,
-    # you'd want a more robust solution that adapts to TikTok's changes
     try:
         # Extract the video ID
         match = re.search(r'video/(\d+)', video_url)
@@ -121,8 +131,7 @@ async def download_tiktok_no_watermark(video_url: str) -> str:
 
         video_id = match.group(1)
         
-        # Try to generate a no-watermark URL using a transformation technique
-        # This approach might need frequent updates as TikTok changes their systems
+        # Try to generate a no-watermark URL
         no_watermark_url = f"https://api2-16-h2.musical.ly/aweme/v1/play/?video_id={video_id}&vr_type=0&is_play_url=1&source=PackSourceEnum_PUBLISH&media_type=4"
         
         return no_watermark_url
@@ -484,6 +493,11 @@ async def download_tiktok(req: TikTokRequest):
         logger.error(f"API error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.options("/api/tiktok")
+async def options_tiktok():
+    """Handle OPTIONS request for CORS preflight."""
+    return JSONResponse(content={})
+
 @app.get("/api/tiktok/download")
 async def stream_download(request: Request, url: str, format: str = "mp4"):
     """Stream download TikTok media directly."""
@@ -547,6 +561,11 @@ async def stream_download(request: Request, url: str, format: str = "mp4"):
         logger.error(f"Download error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.options("/api/tiktok/download")
+async def options_download():
+    """Handle OPTIONS request for CORS preflight."""
+    return JSONResponse(content={})
+
 @app.get("/api/tiktok/batch")
 async def batch_download(urls: str):
     """Process multiple TikTok URLs in parallel."""
@@ -563,6 +582,11 @@ async def batch_download(urls: str):
     except Exception as e:
         logger.error(f"Batch download error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.options("/api/tiktok/batch")
+async def options_batch():
+    """Handle OPTIONS request for CORS preflight."""
+    return JSONResponse(content={})
 
 @app.get("/")
 async def root():
@@ -587,6 +611,7 @@ async def add_security_headers(request: Request, call_next):
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
+# This allows you to run the application with "python app.py"
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
